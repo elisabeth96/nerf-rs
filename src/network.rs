@@ -33,7 +33,6 @@ impl Layer {
     }
 
     fn forward(&self, h: &Vec<f32>, act : ActivationType) -> Vec<f32> {
-        // implement fused activation(W^T * h + b)
         let mut result = Vec::new();
         for out_idx in 0..self.weight.cols {
             let mut sum = 0.0;

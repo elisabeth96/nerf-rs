@@ -86,8 +86,8 @@ impl Camera {
     fn get_ray_dir(&self, i: usize, j: usize) -> Vec3 {
         let tanx = self.alpha_width.tan();
         let tany = self.alpha_height.tan();
-        let mx = 2.0 * i as f32 / self.nx as f32;
-        let my = 2.0 * j as f32 / self.ny as f32;
+        let mx = 2.0 * j as f32 / self.nx as f32;
+        let my = 2.0 * i as f32 / self.ny as f32;
         let dir_local = Vec3::new(-tanx + mx * tanx, -tany + my * tany, 1.0);
         let col = self.dir.cross(&self.up);
         let dir_global = self.up * dir_local.x + col * dir_local.y + self.dir * dir_local.z;
@@ -100,7 +100,7 @@ fn get_sample_locs(near: f32, far: f32, n: usize) -> Vec<f32> {
     let mut rng = rand::thread_rng();
     for i in 0..n {
         let u = rng.gen_range(0.0..1.0);
-        t.push(near + (far - near) * i as f32 / n as f32 * u);
+        t.push(near + (far - near) * (i as f32 + u)/ n as f32);
     }
     t
 }
