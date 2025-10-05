@@ -1,6 +1,5 @@
 use crate::vec3::Vec3;
 
-
 pub struct Matrix {
     elements: Vec<f32>,
     rows: i32,
@@ -70,9 +69,7 @@ impl Network {
 
     pub fn forward(&self, p: &Vec3, view_dir: &Vec3) -> (Vec3, f32) {
         let h_0 = positional_encoding(p, 10);
-        println!("h_0 size after positional encoding: {}", h_0.len());
         let y_dir = positional_encoding(view_dir, 4);
-        println!("y_dir size after positional encoding: {}", y_dir.len());
         let mut h = h_0.clone();
         for i in 0..5 {
             h = self.layers[i].forward(&h, ActivationType::ReLU);
@@ -102,17 +99,14 @@ fn concat(a: &Vec<f32>, b: &Vec<f32>) -> Vec<f32> {
 }
 
 fn positional_encoding(p: &Vec3, n: i32) -> Vec<f32> {
-    let mut v = p.to_vec();
-    let mut prod = 1.0;
-    let pi = std::f32::consts::PI;
-    for _i in 0..n {
-        v.push((prod * p.x).sin());
-        v.push((prod * p.y).sin());
-        v.push((prod * p.z).sin());
-        v.push((prod * p.x).cos());
-        v.push((prod * p.y).cos());
-        v.push((prod * p.z).cos());
-        prod *= 2.0;
+    let base = [p.x, p.y, p.z];
+    let mut v = Vec::with_capacity(3 + 6 * n as usize);
+    v.extend(base);
+    let mut f = 1.0f32;
+    for _ in 0..n {
+        v.extend(base.map(|c| (f * c).sin()));
+        v.extend(base.map(|c| (f * c).cos()));
+        f *= 2.0;
     }
     v
 }

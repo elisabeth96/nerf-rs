@@ -1,12 +1,16 @@
 mod network;
 mod vec3;
 
-use std::fs;
-use serde_json::Value;
-use std::path::Path;
+use network::{Layer, Matrix, Network};
 use rand::Rng;
-use network::{Matrix, Layer, Network};
+use serde_json::Value;
+use std::fs;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use vec3::Vec3;
+
+use std::f32::consts::PI;
 
 fn load_tensor(path: &Path, dims: &[usize]) -> Vec<f32> {
     let bytes = fs::read(path).expect("read tensor");
@@ -14,7 +18,6 @@ fn load_tensor(path: &Path, dims: &[usize]) -> Vec<f32> {
     for chunk in bytes.chunks_exact(4) {
         scalars.push(f32::from_le_bytes(chunk.try_into().unwrap()));
     }
-    //assert_eq!(scalars.len(), dims.iter().product());
     scalars
 }
 
@@ -37,26 +40,22 @@ fn load_tf_samples(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(samples)
 }
 
-fn compute_final_color (o: Vec3, d: Vec3, near : f32, far : f32, t : &Vec<f32>, network: &Network) -> Vec3 {
-    // Create a random number generator
-    let mut rng = rand::thread_rng();
+fn compute_final_color(o: Vec3, d: Vec3, t: &Vec<f32>, network: &Network) -> Vec3 {
     let mut c = Vec::new();
     let mut sigma = Vec::new();
     let n = t.len();
     let d_hat = d.normalize();
 
     for i in 0..n {
-        let xi: f32 = rng.gen_range(0.0..1.0);
-        let t_i = near + (i as f32 + xi) / n as f32 * (far - near);
-        let p = o + d_hat * t_i;
+        let p = o + d_hat * t[i];
         let (c_i, sigma_i) = network.forward(&p, &d_hat);
         c.push(c_i);
         sigma.push(sigma_i);
     }
     let mut t_prod = 1.0f32;
     let mut c_final = Vec3::new(0.0, 0.0, 0.0);
-    for i in 0..n-1 {
-        let delta_i = t[i+1] - t[i];
+    for i in 0..n - 1 {
+        let delta_i = t[i + 1] - t[i];
         let alpha_i = 1.0 - (-sigma[i] * delta_i).exp();
         let w_i = t_prod * alpha_i;
         c_final += c[i] * w_i;
@@ -66,19 +65,110 @@ fn compute_final_color (o: Vec3, d: Vec3, near : f32, far : f32, t : &Vec<f32>, 
     c_final
 }
 
+struct Camera {
+    nx: usize,
+    ny: usize,
+
+    alpha_width: f32,
+    alpha_height: f32,
+
+    pos: Vec3,
+    dir: Vec3,
+    up: Vec3,
+
+    near: f32,
+    far: f32,
+    sample_size: usize,
+}
+
+impl Camera {
+    // gets the normalied ray through pixel (i, j) in world space
+    fn get_ray_dir(&self, i: usize, j: usize) -> Vec3 {
+        let tanx = self.alpha_width.tan();
+        let tany = self.alpha_height.tan();
+        let mx = 2.0 * i as f32 / self.nx as f32;
+        let my = 2.0 * j as f32 / self.ny as f32;
+        let dir_local = Vec3::new(-tanx + mx * tanx, -tany + my * tany, 1.0);
+        let col = self.dir.cross(&self.up);
+        let dir_global = self.up * dir_local.x + col * dir_local.y + self.dir * dir_local.z;
+        dir_global
+    }
+}
+
+fn get_sample_locs(near: f32, far: f32, n: usize) -> Vec<f32> {
+    let mut t = Vec::new();
+    let mut rng = rand::thread_rng();
+    for i in 0..n {
+        let u = rng.gen_range(0.0..1.0);
+        t.push(near + (far - near) * i as f32 / n as f32 * u);
+    }
+    t
+}
+
+fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
+    let mut image = Vec::with_capacity(camera.nx * camera.ny);
+    let o = camera.pos;
+    let total_pixels = camera.nx * camera.ny;
+    let mut pixel_count = 0;
+    
+    for i in 0..camera.ny {
+        for j in 0..camera.nx {
+            let d = camera.get_ray_dir(i, j);
+            let t = get_sample_locs(camera.near, camera.far, camera.sample_size);
+            let c = compute_final_color(o, d, &t, network);
+            image.push(c);
+            
+            pixel_count += 1;
+            if pixel_count % 100 == 0 {
+                let progress = (pixel_count as f32 / total_pixels as f32) * 100.0;
+                println!("Rendering progress: {}/{} pixels ({:.1}%)", pixel_count, total_pixels, progress);
+            }
+        }
+    }
+    
+    println!("Rendering complete: {}/{} pixels (100.0%)", total_pixels, total_pixels);
+    image
+}
+
+fn save_ppm(path: &Path, width: usize, height: usize, pixels: &[Vec3]) -> std::io::Result<()> {
+    assert_eq!(pixels.len(), width * height);
+    let mut f = BufWriter::new(File::create(path)?);
+    write!(f, "P6\n{} {}\n255\n", width, height)?;
+    let mut buf = Vec::with_capacity(pixels.len() * 3);
+    for p in pixels {
+        let r = (p.x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let g = (p.y.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let b = (p.z.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        buf.extend_from_slice(&[r, g, b]);
+    }
+    f.write_all(&buf)
+}
+
+fn get_vec3(node: &Value, key: &str) -> Vec3 {
+    let arr = node[key].as_array().expect(key);
+    Vec3::new(
+        arr[0].as_f64().unwrap() as f32,
+        arr[1].as_f64().unwrap() as f32,
+        arr[2].as_f64().unwrap() as f32,
+    )
+}
+
 fn main() {
     let root = Path::new("/Users/elisabeth/projects/nerf-rs/lego_rust/");
 
     match load_tf_samples(&root.join("tf_reference_samples.json")) {
         Ok(samples) => {
-            println!("JSON structure: {}", serde_json::to_string_pretty(&samples).unwrap());
-            
+            println!(
+                "JSON structure: {}",
+                serde_json::to_string_pretty(&samples).unwrap()
+            );
+
             // Extract values from the first sample
             if let Some(examples) = samples["examples"].as_array() {
                 if !examples.is_empty() {
                     let first_sample = &examples[0];
                     println!("\nFirst sample data:");
-                    
+
                     // Extract pixel coordinates
                     if let Some(pixel) = first_sample["pixel"].as_array() {
                         if pixel.len() >= 2 {
@@ -87,7 +177,7 @@ fn main() {
                             println!("  Pixel: ({}, {})", x, y);
                         }
                     }
-                    
+
                     // Extract ray origin
                     if let Some(ray_o) = first_sample["ray_o"].as_array() {
                         if ray_o.len() >= 3 {
@@ -97,7 +187,7 @@ fn main() {
                             println!("  Ray origin: ({}, {}, {})", x, y, z);
                         }
                     }
-                    
+
                     // Extract ray direction
                     if let Some(ray_d) = first_sample["ray_d"].as_array() {
                         if ray_d.len() >= 3 {
@@ -107,7 +197,7 @@ fn main() {
                             println!("  Ray direction: ({}, {}, {})", x, y, z);
                         }
                     }
-                    
+
                     // Extract coarse_rgb values (all of them)
                     if let Some(coarse_rgb) = first_sample["coarse_rgb"].as_array() {
                         println!("  Coarse RGB values:");
@@ -171,9 +261,13 @@ fn main() {
             "dense6_bias" => dense6_bias = data,
             "dense7_kernel" => dense7_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
             "dense7_bias" => dense7_bias = data,
-            "bottleneck_kernel" => bottleneck_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
+            "bottleneck_kernel" => {
+                bottleneck_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32)
+            }
             "bottleneck_bias" => bottleneck_bias = data,
-            "viewdirs_kernel" => viewdirs_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
+            "viewdirs_kernel" => {
+                viewdirs_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32)
+            }
             "viewdirs_bias" => viewdirs_bias = data,
             "rgb_kernel" => rgb_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
             "rgb_bias" => rgb_bias = data,
@@ -183,7 +277,16 @@ fn main() {
         }
         //println!("{} has {} values", name, data.len());
     }
-    let layers = vec![Layer::new(dense0_kernel, dense0_bias), Layer::new(dense1_kernel, dense1_bias), Layer::new(dense2_kernel, dense2_bias), Layer::new(dense3_kernel, dense3_bias), Layer::new(dense4_kernel, dense4_bias), Layer::new(dense5_kernel, dense5_bias), Layer::new(dense6_kernel, dense6_bias), Layer::new(dense7_kernel, dense7_bias)];
+    let layers = vec![
+        Layer::new(dense0_kernel, dense0_bias),
+        Layer::new(dense1_kernel, dense1_bias),
+        Layer::new(dense2_kernel, dense2_bias),
+        Layer::new(dense3_kernel, dense3_bias),
+        Layer::new(dense4_kernel, dense4_bias),
+        Layer::new(dense5_kernel, dense5_bias),
+        Layer::new(dense6_kernel, dense6_bias),
+        Layer::new(dense7_kernel, dense7_bias),
+    ];
     let bottleneck = Layer::new(bottleneck_kernel, bottleneck_bias);
     let viewdirs = Layer::new(viewdirs_kernel, viewdirs_bias);
     let rgb = Layer::new(rgb_kernel, rgb_bias);
@@ -191,61 +294,29 @@ fn main() {
 
     let network = Network::new(layers, bottleneck, viewdirs, rgb, alpha);
 
-    // load from json
-    let samples = load_tf_samples(&root.join("tf_reference_samples.json")).expect("load tf reference samples");
-    let examples = samples["examples"].as_array().expect("examples array");
-    let first = &examples[0];
-
-    let ray_o = first["ray_o"].as_array().expect("ray_o array");
-    let ray_d = first["ray_d"].as_array().expect("ray_d array");
-    let o = Vec3::new(
-        ray_o[0].as_f64().unwrap() as f32,
-        ray_o[1].as_f64().unwrap() as f32,
-        ray_o[2].as_f64().unwrap() as f32,
-    );
-    let d = Vec3::new(
-        ray_d[0].as_f64().unwrap() as f32,
-        ray_d[1].as_f64().unwrap() as f32,
-        ray_d[2].as_f64().unwrap() as f32,
-    );
+    let samples = load_tf_samples(&root.join("tf_reference_samples.json")).unwrap();
 
     let near = samples["near"].as_f64().unwrap() as f32;
     let far = samples["far"].as_f64().unwrap() as f32;
-    let samples_per_ray = samples["samples_per_ray"].as_u64().unwrap() as usize;
+    let sample_size = samples["samples_per_ray"].as_u64().unwrap() as usize;
+    let pos = get_vec3(&samples, "camera_origin");
+    let dir = get_vec3(&samples, "camera_forward").normalize();
+    let up = get_vec3(&samples, "camera_up").normalize();
 
-    // compute expected color from reference coarse outputs using provided z_vals
-    let z_vals: Vec<f32> = samples["z_vals"]
-        .as_array()
-        .expect("z_vals array")
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect();
-    let coarse_sigma: Vec<f32> = first["coarse_sigma"]
-        .as_array()
-        .expect("coarse_sigma array")
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect();
-    let coarse_rgb_vals = first["coarse_rgb"].as_array().expect("coarse_rgb array");
-    let coarse_rgb: Vec<Vec3> = coarse_rgb_vals
-        .iter()
-        .map(|rgb| {
-            let a = rgb.as_array().unwrap();
-            Vec3::new(a[0].as_f64().unwrap() as f32, a[1].as_f64().unwrap() as f32, a[2].as_f64().unwrap() as f32)
-        })
-        .collect();
+    // fill in image resolution/FOV however you like
+    let cam = Camera {
+        nx: 128,
+        ny: 128,
+        alpha_width: PI / 8.0,
+        alpha_height: PI / 8.0,
+        pos,
+        dir,
+        up,
+        near,
+        far,
+        sample_size,
+    };
 
-    let mut transmittance = 1.0f32;
-    let mut c_expected = Vec3::new(0.0, 0.0, 0.0);
-    for i in 0..(z_vals.len() - 1) {
-        let delta = z_vals[i + 1] - z_vals[i];
-        let alpha = 1.0 - (-coarse_sigma[i] * delta).exp();
-        let weight = transmittance * alpha;
-        c_expected += coarse_rgb[i] * weight;
-        transmittance *= 1.0 - alpha;
-    }
-
-    let c = compute_final_color(o, d, near, far, &z_vals, &network);
-
-    println!("Network computed: {:?}, expected {:?}", c, c_expected);
+    let image = render_image(&network, &cam);
+    save_ppm(&Path::new("output.ppm"), cam.nx, cam.ny, &image).unwrap();
 }
