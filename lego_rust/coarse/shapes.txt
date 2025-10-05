@@ -1,0 +1,24 @@
+dense0_kernel 63 256
+dense0_bias 256
+dense1_kernel 256 256
+dense1_bias 256
+dense2_kernel 256 256
+dense2_bias 256
+dense3_kernel 256 256
+dense3_bias 256
+dense4_kernel 256 256
+dense4_bias 256
+dense5_kernel 319 256
+dense5_bias 256
+dense6_kernel 256 256
+dense6_bias 256
+dense7_kernel 256 256
+dense7_bias 256
+bottleneck_kernel 256 256
+bottleneck_bias 256
+viewdirs_kernel 283 128
+viewdirs_bias 128
+rgb_kernel 128 3
+rgb_bias 3
+alpha_kernel 256 1
+alpha_bias 1
