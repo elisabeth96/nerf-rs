@@ -24,7 +24,8 @@ pub struct Layer {
 
 enum ActivationType {
     ReLU, 
-    Sigmoid
+    Sigmoid,
+    None,
 }
 
 impl Layer {
@@ -32,15 +33,7 @@ impl Layer {
         Self { weight, bias }
     }
 
-    fn forward(&self, h: &Vec<f32>) -> Vec<f32> {
-        self.forward_impl(h, ActivationType::ReLU)
-    }
-
-    fn forward_sigmoid(&self, h: &Vec<f32>) -> Vec<f32> {
-        self.forward_impl(h, ActivationType::Sigmoid)
-    }
-
-    fn forward_impl(&self, h: &Vec<f32>, act : ActivationType) -> Vec<f32> {
+    fn forward(&self, h: &Vec<f32>, act : ActivationType) -> Vec<f32> {
         // implement fused activation(W^T * h + b)
         let mut result = Vec::new();
         for out_idx in 0..self.weight.cols {
@@ -52,7 +45,8 @@ impl Layer {
             let x = sum + self.bias[out_idx as usize];
             let output = match act {
                 ActivationType::ReLU => x.max(0.0),
-                ActivationType::Sigmoid => 1.0 / (1.0 + (-x).exp())
+                ActivationType::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+                ActivationType::None => x
             };
             result.push(output);
         }
@@ -81,20 +75,20 @@ impl Network {
         println!("y_dir size after positional encoding: {}", y_dir.len());
         let mut h = h_0.clone();
         for i in 0..5 {
-            h = self.layers[i].forward(&h);
+            h = self.layers[i].forward(&h, ActivationType::ReLU);
         }
         let h4 = h.clone();
         let s = concat(&h_0, &h4);
         h = s;
         for i in 5..8 {
-            h = self.layers[i].forward(&h)
+            h = self.layers[i].forward(&h, ActivationType::ReLU)
         }
         let h8 = h.clone();
-        let sigma = self.alpha.forward(&h8);
-        let bottleneck = self.bottleneck.forward(&h8);
+        let sigma = self.alpha.forward(&h8, ActivationType::ReLU);
+        let bottleneck = self.bottleneck.forward(&h8, ActivationType::None);
         let q = concat(&bottleneck, &y_dir);
-        let c_hidden = self.viewdirs.forward(&q);
-        let c = self.rgb.forward_sigmoid(&c_hidden);
+        let c_hidden = self.viewdirs.forward(&q, ActivationType::ReLU);
+        let c = self.rgb.forward(&c_hidden, ActivationType::Sigmoid);
         let c_final = Vec3::new(c[0], c[1], c[2]);
         (c_final, sigma[0])
     }
@@ -112,12 +106,12 @@ fn positional_encoding(p: &Vec3, n: i32) -> Vec<f32> {
     let mut prod = 1.0;
     let pi = std::f32::consts::PI;
     for _i in 0..n {
-        v.push((prod * pi * p.x).sin());
-        v.push((prod * pi * p.y).sin());
-        v.push((prod * pi * p.z).sin());
-        v.push((prod * pi * p.x).cos());
-        v.push((prod * pi * p.y).cos());
-        v.push((prod * pi * p.z).cos());
+        v.push((prod * p.x).sin());
+        v.push((prod * p.y).sin());
+        v.push((prod * p.z).sin());
+        v.push((prod * p.x).cos());
+        v.push((prod * p.y).cos());
+        v.push((prod * p.z).cos());
         prod *= 2.0;
     }
     v

@@ -37,25 +37,25 @@ fn load_tf_samples(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(samples)
 }
 
-fn compute_final_color (o: Vec3, d: Vec3, near : f32, far : f32, samples_per_ray : usize, network: &Network) -> Vec3 {
+fn compute_final_color (o: Vec3, d: Vec3, near : f32, far : f32, t : &Vec<f32>, network: &Network) -> Vec3 {
     // Create a random number generator
     let mut rng = rand::thread_rng();
-    let mut t = Vec::new();
     let mut c = Vec::new();
     let mut sigma = Vec::new();
+    let n = t.len();
+    let d_hat = d.normalize();
 
-    for i in 0..samples_per_ray {
+    for i in 0..n {
         let xi: f32 = rng.gen_range(0.0..1.0);
-        let t_i = near + (i as f32 + xi) / samples_per_ray as f32 * (far - near);
-        let p = o + d.normalize() * t_i;
-        let (c_i, sigma_i) = network.forward(&p, &d.normalize());
-        t.push(t_i);
+        let t_i = near + (i as f32 + xi) / n as f32 * (far - near);
+        let p = o + d_hat * t_i;
+        let (c_i, sigma_i) = network.forward(&p, &d_hat);
         c.push(c_i);
         sigma.push(sigma_i);
     }
     let mut t_prod = 1.0f32;
     let mut c_final = Vec3::new(0.0, 0.0, 0.0);
-    for i in 0..samples_per_ray-1 {
+    for i in 0..n-1 {
         let delta_i = t[i+1] - t[i];
         let alpha_i = 1.0 - (-sigma[i] * delta_i).exp();
         let w_i = t_prod * alpha_i;
@@ -245,7 +245,7 @@ fn main() {
         transmittance *= 1.0 - alpha;
     }
 
-    let c = compute_final_color(o, d, near, far, samples_per_ray, &network);
+    let c = compute_final_color(o, d, near, far, &z_vals, &network);
 
     println!("Network computed: {:?}, expected {:?}", c, c_expected);
 }
