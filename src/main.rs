@@ -3,6 +3,9 @@ mod vec3;
 
 use network::{Layer, Matrix, Network};
 use rand::Rng;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use serde_json::Value;
 use std::fs;
 use std::fs::File;
@@ -40,30 +43,60 @@ fn load_tf_samples(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(samples)
 }
 
-fn compute_final_color(o: Vec3, d: Vec3, t: &Vec<f32>, network: &Network) -> Vec3 {
-    let mut c = Vec::new();
-    let mut sigma = Vec::new();
-    let n = t.len();
+//fn compute_final_color(o: Vec3, d: Vec3, t: &Vec<f32>, network: &Network) -> Vec3 {
+//    let mut c = Vec::new();
+//    let mut sigma = Vec::new();
+//    let n = t.len();
+//    let d_hat = d.normalize();
+
+//    for i in 0..n {
+//        let p = o + d_hat * t[i];
+//        let (c_i, sigma_i) = network.forward(&p, &d_hat);
+//        c.push(c_i);
+//        sigma.push(sigma_i);
+//    }
+//    let mut t_prod = 1.0f32;
+//    let mut c_final = Vec3::new(0.0, 0.0, 0.0);
+//    for i in 0..n - 1 {
+//        let delta_i = t[i + 1] - t[i];
+//        let alpha_i = 1.0 - (-sigma[i] * delta_i).exp();
+//        let w_i = t_prod * alpha_i;
+//        c_final += c[i] * w_i;
+
+//        t_prod *= 1.0 - alpha_i;
+//    }
+//    c_final
+//}
+
+fn compute_final_color(o: Vec3, d: Vec3, t: &[f32], network: &Network, far: f32) -> Vec3 {
     let d_hat = d.normalize();
+    let n = t.len();
+
+    let mut T = 1.0f32;                // transmittance
+    let mut rgb = Vec3::new(0.0, 0.0, 0.0);
+    let mut acc = 0.0f32;
 
     for i in 0..n {
         let p = o + d_hat * t[i];
         let (c_i, sigma_i) = network.forward(&p, &d_hat);
-        c.push(c_i);
-        sigma.push(sigma_i);
-    }
-    let mut t_prod = 1.0f32;
-    let mut c_final = Vec3::new(0.0, 0.0, 0.0);
-    for i in 0..n - 1 {
-        let delta_i = t[i + 1] - t[i];
-        let alpha_i = 1.0 - (-sigma[i] * delta_i).exp();
-        let w_i = t_prod * alpha_i;
-        c_final += c[i] * w_i;
 
-        t_prod *= 1.0 - alpha_i;
+        // Use last interval out to 'far' (NeRF uses a very large last delta)
+        let delta = if i + 1 < n { t[i + 1] - t[i] } else { far - t[i] };
+
+        let alpha = 1.0 - (-sigma_i * delta).exp();
+        let w = T * alpha;
+
+        rgb += c_i * w;
+        acc += w;
+        T *= 1.0 - alpha;
+
+        if T < 1e-4 { break; } // optional early-out
     }
-    c_final
+
+    rgb += Vec3::new(1.0, 1.0, 1.0) * (1.0 - acc);
+    rgb
 }
+
 
 struct Camera {
     nx: usize,
@@ -82,49 +115,63 @@ struct Camera {
 }
 
 impl Camera {
-    // gets the normalied ray through pixel (i, j) in world space
     fn get_ray_dir(&self, i: usize, j: usize) -> Vec3 {
-        let tanx = self.alpha_width.tan();
-        let tany = self.alpha_height.tan();
-        let mx = 2.0 * j as f32 / self.nx as f32;
-        let my = 2.0 * i as f32 / self.ny as f32;
-        let dir_local = Vec3::new(-tanx + mx * tanx, -tany + my * tany, 1.0);
-        let col = self.dir.cross(&self.up);
-        let dir_global = self.up * dir_local.x + col * dir_local.y + self.dir * dir_local.z;
-        dir_global
+        // Orthonormal basis
+        let f = self.dir.normalize();
+        let r = f.cross(&self.up).normalize(); // right
+        let u = r.cross(&f).normalize();       // true up
+
+        // Pixel center in NDC [-1,1] with y up
+        let x = ( (j as f32 + 0.5) / self.nx as f32 ) * 2.0 - 1.0;
+        let y = 1.0 - ( (i as f32 + 0.5) / self.ny as f32 ) * 2.0;
+
+        // FOV to slopes
+        let sx = self.alpha_width.tan();
+        let sy = self.alpha_height.tan();
+
+        // Build & return (normalized later)
+        r * (x * sx) + u * (y * sy) + f
     }
 }
 
 fn get_sample_locs(near: f32, far: f32, n: usize) -> Vec<f32> {
-    let mut t = Vec::new();
-    let mut rng = rand::thread_rng();
+    let mut t = Vec::with_capacity(n);
+    let step = (far - near) / n as f32;
     for i in 0..n {
-        let u = rng.gen_range(0.0..1.0);
-        t.push(near + (far - near) * (i as f32 + u)/ n as f32);
+        let u = 0.5;
+        t.push(near + (i as f32 + u) * step);
     }
     t
 }
 
 fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
-    let mut image = Vec::with_capacity(camera.nx * camera.ny);
     let o = camera.pos;
     let total_pixels = camera.nx * camera.ny;
-    let mut pixel_count = 0;
+    let pixel_count = Arc::new(AtomicUsize::new(0));
+    let pixel_count_clone = pixel_count.clone();
     
-    for i in 0..camera.ny {
-        for j in 0..camera.nx {
+    // Create a vector of pixel indices to process in parallel
+    let pixel_indices: Vec<(usize, usize)> = (0..camera.ny)
+        .flat_map(|i| (0..camera.nx).map(move |j| (i, j)))
+        .collect();
+    
+    let image: Vec<Vec3> = pixel_indices
+        .par_iter()
+        .map(|&(i, j)| {
             let d = camera.get_ray_dir(i, j);
             let t = get_sample_locs(camera.near, camera.far, camera.sample_size);
-            let c = compute_final_color(o, d, &t, network);
-            image.push(c);
+            let c = compute_final_color(o, d, &t, network, camera.far);
             
-            pixel_count += 1;
-            if pixel_count % 100 == 0 {
-                let progress = (pixel_count as f32 / total_pixels as f32) * 100.0;
-                println!("Rendering progress: {}/{} pixels ({:.1}%)", pixel_count, total_pixels, progress);
+            // Update progress counter atomically
+            let count = pixel_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 100 == 0 {
+                let progress = (count as f32 / total_pixels as f32) * 100.0;
+                println!("Rendering progress: {}/{} pixels ({:.1}%)", count, total_pixels, progress);
             }
-        }
-    }
+            
+            c
+        })
+        .collect();
     
     println!("Rendering complete: {}/{} pixels (100.0%)", total_pixels, total_pixels);
     image
