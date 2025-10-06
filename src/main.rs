@@ -4,6 +4,7 @@ mod vec3;
 use network::{Layer, Matrix, Network};
 use rayon::prelude::*;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -41,6 +42,74 @@ fn load_tf_samples(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(path)?;
     let samples: Value = serde_json::from_str(&content)?;
     Ok(samples)
+}
+
+fn load_network_from_dir(dir: &Path) -> Network {
+    let mut params: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
+    for (name, dims) in load_shapes(&dir.join("shapes.txt")) {
+        let data = load_tensor(&dir.join(format!("{name}.bin")), &dims);
+        params.insert(name, (dims, data));
+    }
+
+    fn take_matrix(
+        params: &mut HashMap<String, (Vec<usize>, Vec<f32>)>,
+        name: &str,
+    ) -> Matrix {
+        let (dims, data) = params
+            .remove(name)
+            .unwrap_or_else(|| panic!("missing matrix parameter: {name}"));
+        debug_assert!(dims.len() == 2, "matrix dims mismatch for {name}");
+        debug_assert_eq!(dims[0] * dims[1], data.len());
+        Matrix::new(data, dims[0] as i32, dims[1] as i32)
+    }
+
+    fn take_bias(params: &mut HashMap<String, (Vec<usize>, Vec<f32>)>, name: &str) -> Vec<f32> {
+        let (dims, data) = params
+            .remove(name)
+            .unwrap_or_else(|| panic!("missing bias parameter: {name}"));
+        debug_assert!(dims.len() == 1, "bias dims mismatch for {name}");
+        debug_assert_eq!(dims[0], data.len());
+        data
+    }
+
+    let dense_specs = [
+        ("dense0_kernel", "dense0_bias"),
+        ("dense1_kernel", "dense1_bias"),
+        ("dense2_kernel", "dense2_bias"),
+        ("dense3_kernel", "dense3_bias"),
+        ("dense4_kernel", "dense4_bias"),
+        ("dense5_kernel", "dense5_bias"),
+        ("dense6_kernel", "dense6_bias"),
+        ("dense7_kernel", "dense7_bias"),
+    ];
+
+    let layers = dense_specs
+        .into_iter()
+        .map(|(kernel, bias)| {
+            Layer::new(take_matrix(&mut params, kernel), take_bias(&mut params, bias))
+        })
+        .collect();
+
+    let bottleneck = Layer::new(
+        take_matrix(&mut params, "bottleneck_kernel"),
+        take_bias(&mut params, "bottleneck_bias"),
+    );
+    let viewdirs = Layer::new(
+        take_matrix(&mut params, "viewdirs_kernel"),
+        take_bias(&mut params, "viewdirs_bias"),
+    );
+    let rgb = Layer::new(
+        take_matrix(&mut params, "rgb_kernel"),
+        take_bias(&mut params, "rgb_bias"),
+    );
+    let alpha = Layer::new(
+        take_matrix(&mut params, "alpha_kernel"),
+        take_bias(&mut params, "alpha_bias"),
+    );
+
+    debug_assert!(params.is_empty(), "unused parameters left after load");
+
+    Network::new(layers, bottleneck, viewdirs, rgb, alpha)
 }
 
 fn integrate_ray(colors: &[Vec3], sigmas: &[f32], t: &[f32], far: f32) -> Vec3 {
@@ -131,10 +200,15 @@ fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
     let origin = camera.pos;
     let total_pixels = camera.nx * camera.ny;
     let sample_positions = get_sample_locs(camera.near, camera.far, camera.samples_per_ray);
+    assert!(!sample_positions.is_empty(), "samples_per_ray must be greater than 0");
+
     let pixel_count = Arc::new(AtomicUsize::new(0));
     let pixel_count_clone = pixel_count.clone();
 
     let block_size = 8usize;
+    assert_eq!(camera.nx % block_size, 0, "image width must be multiple of block size");
+    assert_eq!(camera.ny % block_size, 0, "image height must be multiple of block size");
+
     let block_coords: Vec<(usize, usize)> = (0..camera.ny)
         .step_by(block_size)
         .flat_map(|block_y| {
@@ -148,55 +222,42 @@ fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
         .par_iter()
         .map(|&(block_y, block_x)| {
             let mut rays = Vec::new();
-            let max_y = (block_y + block_size).min(camera.ny);
-            let max_x = (block_x + block_size).min(camera.nx);
-            for i in block_y..max_y {
-                for j in block_x..max_x {
+            for i in block_y..block_y + block_size {
+                for j in block_x..block_x + block_size {
                     let dir = camera.get_ray_dir(i, j);
                     rays.push((i * camera.nx + j, dir.normalize()));
                 }
             }
 
-            if rays.is_empty() {
-                return Vec::new();
+            let samples_per_ray = sample_positions.len();
+            let total_samples = rays.len() * samples_per_ray;
+            let mut points = Matrix::zeros(3, total_samples as i32);
+            let mut view_dirs = Vec::with_capacity(total_samples);
+
+            for (ray_idx, (_, dir_hat)) in rays.iter().enumerate() {
+                for (sample_idx, &ti) in sample_positions.iter().enumerate() {
+                    let col = ray_idx * samples_per_ray + sample_idx;
+                    let p = origin + *dir_hat * ti;
+                    points.set(0, col, p.x);
+                    points.set(1, col, p.y);
+                    points.set(2, col, p.z);
+                    view_dirs.push(*dir_hat);
+                }
             }
 
-            let samples_per_ray = sample_positions.len();
+            let (sample_colors, sample_sigmas) = network.forward_batch(&points, &view_dirs);
+
             let mut results = Vec::with_capacity(rays.len());
-
-            if samples_per_ray == 0 {
-                for (pixel_index, _) in &rays {
-                    results.push((*pixel_index, Vec3::new(0.0, 0.0, 0.0)));
-                }
-            } else {
-                let total_samples = rays.len() * samples_per_ray;
-                let mut points = Matrix::zeros(3, total_samples as i32);
-                let mut view_dirs = Vec::with_capacity(total_samples);
-
-                for (ray_idx, (_, dir_hat)) in rays.iter().enumerate() {
-                    for (sample_idx, &ti) in sample_positions.iter().enumerate() {
-                        let col = ray_idx * samples_per_ray + sample_idx;
-                        let p = origin + *dir_hat * ti;
-                        points.set(0, col, p.x);
-                        points.set(1, col, p.y);
-                        points.set(2, col, p.z);
-                        view_dirs.push(*dir_hat);
-                    }
-                }
-
-                let (sample_colors, sample_sigmas) = network.forward_batch(&points, &view_dirs);
-
-                for (ray_idx, (pixel_index, _)) in rays.iter().enumerate() {
-                    let start = ray_idx * samples_per_ray;
-                    let end = start + samples_per_ray;
-                    let color = integrate_ray(
-                        &sample_colors[start..end],
-                        &sample_sigmas[start..end],
-                        &sample_positions,
-                        camera.far,
-                    );
-                    results.push((*pixel_index, color));
-                }
+            for (ray_idx, (pixel_index, _)) in rays.iter().enumerate() {
+                let start = ray_idx * samples_per_ray;
+                let end = start + samples_per_ray;
+                let color = integrate_ray(
+                    &sample_colors[start..end],
+                    &sample_sigmas[start..end],
+                    &sample_positions,
+                    camera.far,
+                );
+                results.push((*pixel_index, color));
             }
 
             let processed = pixel_count_clone.fetch_add(rays.len(), Ordering::Relaxed) + rays.len();
@@ -252,84 +313,9 @@ fn get_vec3(node: &Value, key: &str) -> Vec3 {
 }
 
 fn main() {
-    let root = Path::new("/Users/elisabeth/projects/nerf-rs/lego_rust/");
-
-    let mut dense0_kernel = Matrix::empty();
-    let mut dense0_bias = Vec::new();
-    let mut dense1_kernel = Matrix::empty();
-    let mut dense1_bias = Vec::new();
-    let mut dense2_kernel = Matrix::empty();
-    let mut dense2_bias = Vec::new();
-    let mut dense3_kernel = Matrix::empty();
-    let mut dense3_bias = Vec::new();
-    let mut dense4_kernel = Matrix::empty();
-    let mut dense4_bias = Vec::new();
-    let mut dense5_kernel = Matrix::empty();
-    let mut dense5_bias = Vec::new();
-    let mut dense6_kernel = Matrix::empty();
-    let mut dense6_bias = Vec::new();
-    let mut dense7_kernel = Matrix::empty();
-    let mut dense7_bias = Vec::new();
-    let mut bottleneck_kernel = Matrix::empty();
-    let mut bottleneck_bias = Vec::new();
-    let mut viewdirs_kernel = Matrix::empty();
-    let mut viewdirs_bias = Vec::new();
-    let mut rgb_kernel = Matrix::empty();
-    let mut rgb_bias = Vec::new();
-    let mut alpha_kernel = Matrix::empty();
-    let mut alpha_bias = Vec::new();
-
-    for (name, dims) in load_shapes(&root.join("coarse/shapes.txt")) {
-        let data = load_tensor(&root.join(format!("coarse/{name}.bin")), &dims);
-        match name.as_str() {
-            "dense0_kernel" => dense0_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense0_bias" => dense0_bias = data,
-            "dense1_kernel" => dense1_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense1_bias" => dense1_bias = data,
-            "dense2_kernel" => dense2_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense2_bias" => dense2_bias = data,
-            "dense3_kernel" => dense3_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense3_bias" => dense3_bias = data,
-            "dense4_kernel" => dense4_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense4_bias" => dense4_bias = data,
-            "dense5_kernel" => dense5_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense5_bias" => dense5_bias = data,
-            "dense6_kernel" => dense6_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense6_bias" => dense6_bias = data,
-            "dense7_kernel" => dense7_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "dense7_bias" => dense7_bias = data,
-            "bottleneck_kernel" => {
-                bottleneck_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32)
-            }
-            "bottleneck_bias" => bottleneck_bias = data,
-            "viewdirs_kernel" => {
-                viewdirs_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32)
-            }
-            "viewdirs_bias" => viewdirs_bias = data,
-            "rgb_kernel" => rgb_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "rgb_bias" => rgb_bias = data,
-            "alpha_kernel" => alpha_kernel = Matrix::new(data, dims[0] as i32, dims[1] as i32),
-            "alpha_bias" => alpha_bias = data,
-            _ => panic!("Unknown tensor: {}", name),
-        }
-        //println!("{} has {} values", name, data.len());
-    }
-    let layers = vec![
-        Layer::new(dense0_kernel, dense0_bias),
-        Layer::new(dense1_kernel, dense1_bias),
-        Layer::new(dense2_kernel, dense2_bias),
-        Layer::new(dense3_kernel, dense3_bias),
-        Layer::new(dense4_kernel, dense4_bias),
-        Layer::new(dense5_kernel, dense5_bias),
-        Layer::new(dense6_kernel, dense6_bias),
-        Layer::new(dense7_kernel, dense7_bias),
-    ];
-    let bottleneck = Layer::new(bottleneck_kernel, bottleneck_bias);
-    let viewdirs = Layer::new(viewdirs_kernel, viewdirs_bias);
-    let rgb = Layer::new(rgb_kernel, rgb_bias);
-    let alpha = Layer::new(alpha_kernel, alpha_bias);
-
-    let network = Network::new(layers, bottleneck, viewdirs, rgb, alpha);
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.join("lego_rust");
+    let network = load_network_from_dir(&root.join("coarse"));
 
     let samples = load_tf_samples(&root.join("tf_reference_samples.json")).unwrap();
 
@@ -367,4 +353,195 @@ fn main() {
         render_duration.as_secs_f64()
     );
     save_ppm(&Path::new("output.ppm"), cam.nx, cam.ny, &image).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(label: &str, expected: f32, actual: f32) {
+        let diff = (expected - actual).abs();
+        assert!(
+            diff < 1e-2,
+            "{} mismatch: expected {} got {} (diff {})",
+            label,
+            expected,
+            actual,
+            diff
+        );
+    }
+
+    struct Example {
+        ray_dir: Vec3,
+        view_dir: Vec3,
+        coarse_sigmas: [f32; 5],
+        coarse_rgb: [[f32; 3]; 5],
+        fine_sigmas: [f32; 5],
+        fine_rgb: [[f32; 3]; 5],
+    }
+
+    #[test]
+    fn coarse_and_fine_match_reference_examples() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let coarse = load_network_from_dir(&manifest_dir.join("lego_rust/coarse"));
+        let fine = load_network_from_dir(&manifest_dir.join("lego_rust/fine"));
+
+        let origin = Vec3::new(-0.053798322, 3.8454704, 1.2080823);
+        let sample_positions = [2.0f32, 3.0, 4.0, 5.0, 6.0];
+
+        let examples = [
+            Example {
+                ray_dir: Vec3 {
+                    x: 0.013345719,
+                    y: -0.95394367,
+                    z: -0.2996883,
+                },
+                view_dir: Vec3 {
+                    x: 0.013345721,
+                    y: -0.9539438,
+                    z: -0.29968834,
+                },
+                coarse_sigmas: [0.0, 0.0, 57.520237, 112.53807, 36.354565],
+                coarse_rgb: [
+                    [0.9999987, 0.9999991, 1.0],
+                    [0.17455171, 0.1438829, 0.089204505],
+                    [0.33823228, 0.2553625, 0.09265556],
+                    [0.7298782, 0.65580726, 0.4858736],
+                    [0.99999994, 0.99999994, 1.0],
+                ],
+                fine_sigmas: [0.0, 0.0, 116.636, 213.10716, 0.0],
+                fine_rgb: [
+                    [0.9989065, 0.998896, 0.999808],
+                    [0.9112585, 0.94893014, 0.99545395],
+                    [0.4137012, 0.33586174, 0.09175034],
+                    [0.8538921, 0.77298534, 0.6327022],
+                    [1.0, 1.0, 1.0],
+                ],
+            },
+            Example {
+                ray_dir: Vec3 {
+                    x: -0.02204708,
+                    y: -0.9975982,
+                    z: -0.16230695,
+                },
+                view_dir: Vec3 {
+                    x: -0.021808151,
+                    y: -0.986787,
+                    z: -0.160548,
+                },
+                coarse_sigmas: [0.0, 1.2744776, 0.0, 0.0, 0.0],
+                coarse_rgb: [
+                    [0.9975145, 0.9993601, 0.99999815],
+                    [0.77613157, 0.5667896, 0.061884273],
+                    [0.95516205, 0.8531487, 0.18930879],
+                    [0.9998949, 0.9997925, 0.99985504],
+                    [1.0, 1.0, 1.0],
+                ],
+                fine_sigmas: [0.0, 0.0, 0.0, 0.0, 0.0],
+                fine_rgb: [
+                    [0.9822932, 0.9836513, 0.9970033],
+                    [0.8241439, 0.8009091, 0.56087965],
+                    [0.98987126, 0.97824395, 0.88446456],
+                    [0.99906117, 0.99984854, 0.9999975],
+                    [1.0, 1.0, 1.0],
+                ],
+            },
+            Example {
+                ray_dir: Vec3 {
+                    x: 0.22856998,
+                    y: -0.8969835,
+                    z: -0.471415,
+                },
+                view_dir: Vec3 {
+                    x: 0.22003776,
+                    y: -0.86350024,
+                    z: -0.4538177,
+                },
+                coarse_sigmas: [0.0, 0.0, 2.6539133, 34.351215, 0.0],
+                coarse_rgb: [
+                    [1.0, 1.0, 1.0],
+                    [0.9997359, 0.9998949, 0.99999803],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                ],
+                fine_sigmas: [0.0, 0.0, 0.0, 0.0, 0.0],
+                fine_rgb: [
+                    [0.9998816, 0.9998875, 0.9999629],
+                    [0.99769306, 0.99890935, 0.9998496],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 1.0],
+                ],
+            },
+        ];
+
+        for (example_idx, example) in examples.iter().enumerate() {
+            let mut points = Matrix::zeros(3, sample_positions.len() as i32);
+            let mut view_dirs = Vec::with_capacity(sample_positions.len());
+
+            for (col, &t) in sample_positions.iter().enumerate() {
+                let dir = example.view_dir;
+                let p = origin + example.ray_dir * t;
+                points.set(0, col, p.x);
+                points.set(1, col, p.y);
+                points.set(2, col, p.z);
+                view_dirs.push(dir);
+            }
+
+            let (coarse_colors, coarse_sigmas) = coarse.forward_batch(&points, &view_dirs);
+            for (idx, &expected_sigma) in example.coarse_sigmas.iter().enumerate() {
+                assert_close(
+                    &format!("coarse[{example_idx}].sigma[{idx}]"),
+                    expected_sigma,
+                    coarse_sigmas[idx],
+                );
+            }
+            for (idx, color) in coarse_colors.iter().enumerate() {
+                let expected = example.coarse_rgb[idx];
+                assert_close(
+                    &format!("coarse[{example_idx}].color[{idx}].r"),
+                    expected[0],
+                    color.x,
+                );
+                assert_close(
+                    &format!("coarse[{example_idx}].color[{idx}].g"),
+                    expected[1],
+                    color.y,
+                );
+                assert_close(
+                    &format!("coarse[{example_idx}].color[{idx}].b"),
+                    expected[2],
+                    color.z,
+                );
+            }
+
+            let (fine_colors, fine_sigmas) = fine.forward_batch(&points, &view_dirs);
+            for (idx, &expected_sigma) in example.fine_sigmas.iter().enumerate() {
+                assert_close(
+                    &format!("fine[{example_idx}].sigma[{idx}]"),
+                    expected_sigma,
+                    fine_sigmas[idx],
+                );
+            }
+            for (idx, color) in fine_colors.iter().enumerate() {
+                let expected = example.fine_rgb[idx];
+                assert_close(
+                    &format!("fine[{example_idx}].color[{idx}].r"),
+                    expected[0],
+                    color.x,
+                );
+                assert_close(
+                    &format!("fine[{example_idx}].color[{idx}].g"),
+                    expected[1],
+                    color.y,
+                );
+                assert_close(
+                    &format!("fine[{example_idx}].color[{idx}].b"),
+                    expected[2],
+                    color.z,
+                );
+            }
+        }
+    }
 }

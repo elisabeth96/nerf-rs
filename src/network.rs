@@ -17,14 +17,6 @@ impl Matrix {
         }
     }
 
-    pub fn empty() -> Self {
-        Self {
-            elements: Vec::new(),
-            rows: 0,
-            cols: 0,
-        }
-    }
-
     pub fn zeros(rows: i32, cols: i32) -> Self {
         Self {
             elements: vec![0.0; (rows * cols) as usize],
