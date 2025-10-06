@@ -2,21 +2,20 @@ mod network;
 mod vec3;
 
 use network::{Layer, Matrix, Network};
-use rand::Rng;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use serde_json::Value;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use vec3::Vec3;
 
 use std::f32::consts::PI;
 
-fn load_tensor(path: &Path, dims: &[usize]) -> Vec<f32> {
+fn load_tensor(path: &Path, _dims: &[usize]) -> Vec<f32> {
     let bytes = fs::read(path).expect("read tensor");
     let mut scalars = Vec::with_capacity(bytes.len() / 4);
     for chunk in bytes.chunks_exact(4) {
@@ -69,35 +68,43 @@ fn load_tf_samples(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
 //    c_final
 //}
 
-fn compute_final_color(o: Vec3, d: Vec3, t: &[f32], network: &Network, far: f32) -> Vec3 {
-    let d_hat = d.normalize();
+fn integrate_ray(colors: &[Vec3], sigmas: &[f32], t: &[f32], far: f32) -> Vec3 {
     let n = t.len();
+    if n == 0 {
+        return Vec3::new(0.0, 0.0, 0.0);
+    }
 
-    let mut T = 1.0f32;                // transmittance
+    debug_assert_eq!(colors.len(), n);
+    debug_assert_eq!(sigmas.len(), n);
+
+    let mut transmittance = 1.0f32;
     let mut rgb = Vec3::new(0.0, 0.0, 0.0);
     let mut acc = 0.0f32;
 
     for i in 0..n {
-        let p = o + d_hat * t[i];
-        let (c_i, sigma_i) = network.forward(&p, &d_hat);
+        let c_i = colors[i];
+        let sigma_i = sigmas[i];
 
-        // Use last interval out to 'far' (NeRF uses a very large last delta)
-        let delta = if i + 1 < n { t[i + 1] - t[i] } else { far - t[i] };
+        let delta = if i + 1 < n {
+            t[i + 1] - t[i]
+        } else {
+            far - t[i]
+        };
 
         let alpha = 1.0 - (-sigma_i * delta).exp();
-        let w = T * alpha;
+        let w = transmittance * alpha;
 
         rgb += c_i * w;
         acc += w;
-        T *= 1.0 - alpha;
+        transmittance *= 1.0 - alpha;
 
-        if T < 1e-4 { break; } // optional early-out
+        if transmittance < 1e-4 {
+            break;
+        }
     }
 
-    rgb += Vec3::new(1.0, 1.0, 1.0) * (1.0 - acc);
-    rgb
+    rgb + Vec3::new(1.0, 1.0, 1.0) * (1.0 - acc)
 }
-
 
 struct Camera {
     nx: usize,
@@ -120,11 +127,11 @@ impl Camera {
         // Orthonormal basis
         let f = self.dir.normalize();
         let r = f.cross(&self.up).normalize(); // right
-        let u = r.cross(&f).normalize();       // true up
+        let u = r.cross(&f).normalize(); // true up
 
         // Pixel center in NDC [-1,1] with y up
-        let x = ( (j as f32 + 0.5) / self.nx as f32 ) * 2.0 - 1.0;
-        let y = 1.0 - ( (i as f32 + 0.5) / self.ny as f32 ) * 2.0;
+        let x = ((j as f32 + 0.5) / self.nx as f32) * 2.0 - 1.0;
+        let y = 1.0 - ((i as f32 + 0.5) / self.ny as f32) * 2.0;
 
         // FOV to slopes
         let sx = self.alpha_width.tan();
@@ -146,34 +153,103 @@ fn get_sample_locs(near: f32, far: f32, n: usize) -> Vec<f32> {
 }
 
 fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
-    let o = camera.pos;
+    let origin = camera.pos;
     let total_pixels = camera.nx * camera.ny;
+    let sample_positions = get_sample_locs(camera.near, camera.far, camera.samples_per_ray);
     let pixel_count = Arc::new(AtomicUsize::new(0));
     let pixel_count_clone = pixel_count.clone();
-    
-    // Create a vector of pixel indices to process in parallel
-    let pixel_indices: Vec<(usize, usize)> = (0..camera.ny)
-        .flat_map(|i| (0..camera.nx).map(move |j| (i, j)))
-        .collect();
-    
-    let image: Vec<Vec3> = pixel_indices
-        .par_iter()
-        .map(|&(i, j)| {
-            let d = camera.get_ray_dir(i, j);
-            let t = get_sample_locs(camera.near, camera.far, camera.samples_per_ray);
-            let c = compute_final_color(o, d, &t, network, camera.far);
-            
-            let count = pixel_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 5000 == 0 {
-                let progress = (count as f32 / total_pixels as f32) * 100.0;
-                println!("Rendering progress: {}/{} pixels ({:.1}%)", count, total_pixels, progress);
-            }
-            
-            c
+
+    let block_size = 8usize;
+    let block_coords: Vec<(usize, usize)> = (0..camera.ny)
+        .step_by(block_size)
+        .flat_map(|block_y| {
+            (0..camera.nx)
+                .step_by(block_size)
+                .map(move |block_x| (block_y, block_x))
         })
         .collect();
-    
-    println!("Rendering complete: {}/{} pixels (100.0%)", total_pixels, total_pixels);
+
+    let block_results: Vec<Vec<(usize, Vec3)>> = block_coords
+        .par_iter()
+        .map(|&(block_y, block_x)| {
+            let mut rays = Vec::new();
+            let max_y = (block_y + block_size).min(camera.ny);
+            let max_x = (block_x + block_size).min(camera.nx);
+            for i in block_y..max_y {
+                for j in block_x..max_x {
+                    let dir = camera.get_ray_dir(i, j);
+                    rays.push((i * camera.nx + j, dir.normalize()));
+                }
+            }
+
+            if rays.is_empty() {
+                return Vec::new();
+            }
+
+            let samples_per_ray = sample_positions.len();
+            let mut results = Vec::with_capacity(rays.len());
+
+            if samples_per_ray == 0 {
+                for (pixel_index, _) in &rays {
+                    results.push((*pixel_index, Vec3::new(0.0, 0.0, 0.0)));
+                }
+            } else {
+                let total_samples = rays.len() * samples_per_ray;
+                let mut points = Matrix::zeros(3, total_samples as i32);
+                let mut view_dirs = Vec::with_capacity(total_samples);
+
+                for (ray_idx, (_, dir_hat)) in rays.iter().enumerate() {
+                    for (sample_idx, &ti) in sample_positions.iter().enumerate() {
+                        let col = ray_idx * samples_per_ray + sample_idx;
+                        let p = origin + *dir_hat * ti;
+                        points.set(0, col, p.x);
+                        points.set(1, col, p.y);
+                        points.set(2, col, p.z);
+                        view_dirs.push(*dir_hat);
+                    }
+                }
+
+                let (sample_colors, sample_sigmas) = network.forward_batch(&points, &view_dirs);
+
+                for (ray_idx, (pixel_index, _)) in rays.iter().enumerate() {
+                    let start = ray_idx * samples_per_ray;
+                    let end = start + samples_per_ray;
+                    let color = integrate_ray(
+                        &sample_colors[start..end],
+                        &sample_sigmas[start..end],
+                        &sample_positions,
+                        camera.far,
+                    );
+                    results.push((*pixel_index, color));
+                }
+            }
+
+            let processed = pixel_count_clone.fetch_add(rays.len(), Ordering::Relaxed) + rays.len();
+            let prev = processed - rays.len();
+            if processed / 5000 != prev / 5000 {
+                let progress = (processed as f32 / total_pixels as f32) * 100.0;
+                println!(
+                    "Rendering progress: {}/{} pixels ({:.1}%)",
+                    processed, total_pixels, progress
+                );
+            }
+
+            results
+        })
+        .collect();
+
+    let mut image = vec![Vec3::new(0.0, 0.0, 0.0); total_pixels];
+    for block in block_results {
+        for (index, color) in block {
+            image[index] = color;
+        }
+    }
+
+    println!(
+        "Rendering complete: {}/{} pixels (100.0%)",
+        total_pixels, total_pixels
+    );
+
     image
 }
 
@@ -303,14 +379,17 @@ fn main() {
         up,
         near,
         far,
-        samples_per_ray
+        samples_per_ray,
     };
 
     println!("Starting image rendering...");
     let render_start = Instant::now();
     let image = render_image(&network, &cam);
     let render_duration = render_start.elapsed();
-    
-    println!("Rendering completed in {:.2} seconds", render_duration.as_secs_f64());
+
+    println!(
+        "Rendering completed in {:.2} seconds",
+        render_duration.as_secs_f64()
+    );
     save_ppm(&Path::new("output.ppm"), cam.nx, cam.ny, &image).unwrap();
 }
