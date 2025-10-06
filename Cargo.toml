@@ -2,9 +2,14 @@
 name = "nerf-rs"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.8"
 rayon = "1.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accelerate-src = "0.3.2"
+cblas-sys = "0.3.0"

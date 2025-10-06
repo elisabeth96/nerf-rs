@@ -164,7 +164,7 @@ fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
             let c = compute_final_color(o, d, &t, network, camera.far);
             
             let count = pixel_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 1000 == 0 {
+            if count % 5000 == 0 {
                 let progress = (count as f32 / total_pixels as f32) * 100.0;
                 println!("Rendering progress: {}/{} pixels ({:.1}%)", count, total_pixels, progress);
             }
@@ -352,8 +352,8 @@ fn main() {
 
     // fill in image resolution/FOV however you like
     let cam = Camera {
-        nx: 128,
-        ny: 128,
+        nx: 256,
+        ny: 256,
         alpha_width: PI / 8.0,
         alpha_height: PI / 8.0,
         pos,

@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "accelerate-src"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "415ed64958754dbe991900f3940677e6a7eefb4d7367afd70d642677b0c7d19d"
+
+[[package]]
+name = "cblas-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7211d558677a4f41a6c0815295cff14d798209b631d8390586efc2f6b98b0f16"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -72,6 +84,8 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 name = "nerf-rs"
 version = "0.1.0"
 dependencies = [
+ "accelerate-src",
+ "cblas-sys",
  "rand",
  "rayon",
  "serde",
