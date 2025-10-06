@@ -11,6 +11,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::time::Instant;
 use vec3::Vec3;
 
 use std::f32::consts::PI;
@@ -162,9 +163,8 @@ fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
             let t = get_sample_locs(camera.near, camera.far, camera.sample_size);
             let c = compute_final_color(o, d, &t, network, camera.far);
             
-            // Update progress counter atomically
             let count = pixel_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
-            if count % 100 == 0 {
+            if count % 1000 == 0 {
                 let progress = (count as f32 / total_pixels as f32) * 100.0;
                 println!("Rendering progress: {}/{} pixels ({:.1}%)", count, total_pixels, progress);
             }
@@ -364,6 +364,12 @@ fn main() {
         sample_size,
     };
 
+    println!("Starting image rendering...");
+    let render_start = Instant::now();
     let image = render_image(&network, &cam);
+    let render_duration = render_start.elapsed();
+    
+    println!("Rendering completed in {:.2} seconds", render_duration.as_secs_f64());
     save_ppm(&Path::new("output.ppm"), cam.nx, cam.ny, &image).unwrap();
+
 }
