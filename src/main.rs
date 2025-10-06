@@ -112,7 +112,7 @@ struct Camera {
 
     near: f32,
     far: f32,
-    sample_size: usize,
+    samples_per_ray: usize,
 }
 
 impl Camera {
@@ -160,7 +160,7 @@ fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
         .par_iter()
         .map(|&(i, j)| {
             let d = camera.get_ray_dir(i, j);
-            let t = get_sample_locs(camera.near, camera.far, camera.sample_size);
+            let t = get_sample_locs(camera.near, camera.far, camera.samples_per_ray);
             let c = compute_final_color(o, d, &t, network, camera.far);
             
             let count = pixel_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
@@ -203,67 +203,6 @@ fn get_vec3(node: &Value, key: &str) -> Vec3 {
 fn main() {
     let root = Path::new("/Users/elisabeth/projects/nerf-rs/lego_rust/");
 
-    match load_tf_samples(&root.join("tf_reference_samples.json")) {
-        Ok(samples) => {
-            println!(
-                "JSON structure: {}",
-                serde_json::to_string_pretty(&samples).unwrap()
-            );
-
-            // Extract values from the first sample
-            if let Some(examples) = samples["examples"].as_array() {
-                if !examples.is_empty() {
-                    let first_sample = &examples[0];
-                    println!("\nFirst sample data:");
-
-                    // Extract pixel coordinates
-                    if let Some(pixel) = first_sample["pixel"].as_array() {
-                        if pixel.len() >= 2 {
-                            let x = pixel[0].as_u64().unwrap();
-                            let y = pixel[1].as_u64().unwrap();
-                            println!("  Pixel: ({}, {})", x, y);
-                        }
-                    }
-
-                    // Extract ray origin
-                    if let Some(ray_o) = first_sample["ray_o"].as_array() {
-                        if ray_o.len() >= 3 {
-                            let x = ray_o[0].as_f64().unwrap();
-                            let y = ray_o[1].as_f64().unwrap();
-                            let z = ray_o[2].as_f64().unwrap();
-                            println!("  Ray origin: ({}, {}, {})", x, y, z);
-                        }
-                    }
-
-                    // Extract ray direction
-                    if let Some(ray_d) = first_sample["ray_d"].as_array() {
-                        if ray_d.len() >= 3 {
-                            let x = ray_d[0].as_f64().unwrap();
-                            let y = ray_d[1].as_f64().unwrap();
-                            let z = ray_d[2].as_f64().unwrap();
-                            println!("  Ray direction: ({}, {}, {})", x, y, z);
-                        }
-                    }
-
-                    // Extract coarse_rgb values (all of them)
-                    if let Some(coarse_rgb) = first_sample["coarse_rgb"].as_array() {
-                        println!("  Coarse RGB values:");
-                        for (i, rgb_value) in coarse_rgb.iter().enumerate() {
-                            if let Some(rgb_array) = rgb_value.as_array() {
-                                if rgb_array.len() >= 3 {
-                                    let r = rgb_array[0].as_f64().unwrap();
-                                    let g = rgb_array[1].as_f64().unwrap();
-                                    let b = rgb_array[2].as_f64().unwrap();
-                                    println!("    Sample {}: ({}, {}, {})", i, r, g, b);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => println!("Error: {}", e),
-    }
     let mut dense0_kernel = Matrix::empty();
     let mut dense0_bias = Vec::new();
     let mut dense1_kernel = Matrix::empty();
@@ -345,15 +284,18 @@ fn main() {
 
     let near = samples["near"].as_f64().unwrap() as f32;
     let far = samples["far"].as_f64().unwrap() as f32;
-    let sample_size = samples["samples_per_ray"].as_u64().unwrap() as usize;
+    let samples_per_ray = samples["samples_per_ray"].as_u64().unwrap() as usize;
     let pos = get_vec3(&samples, "camera_origin");
     let dir = get_vec3(&samples, "camera_forward").normalize();
     let up = get_vec3(&samples, "camera_up").normalize();
 
+    // print samples per ray
+    println!("Samples per ray: {}", samples_per_ray);
+
     // fill in image resolution/FOV however you like
     let cam = Camera {
-        nx: 256,
-        ny: 256,
+        nx: 512,
+        ny: 512,
         alpha_width: PI / 8.0,
         alpha_height: PI / 8.0,
         pos,
@@ -361,7 +303,7 @@ fn main() {
         up,
         near,
         far,
-        sample_size,
+        samples_per_ray
     };
 
     println!("Starting image rendering...");
@@ -371,5 +313,4 @@ fn main() {
     
     println!("Rendering completed in {:.2} seconds", render_duration.as_secs_f64());
     save_ppm(&Path::new("output.ppm"), cam.nx, cam.ny, &image).unwrap();
-
 }
