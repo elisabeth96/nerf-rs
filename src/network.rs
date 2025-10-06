@@ -202,17 +202,6 @@ impl Network {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn forward(&self, p: &Vec3, view_dir: &Vec3) -> (Vec3, f32) {
-        let mut points = Matrix::zeros(3, 1);
-        points.set(0, 0, p.x);
-        points.set(1, 0, p.y);
-        points.set(2, 0, p.z);
-        let directions = [*view_dir];
-        let (colors, sigma) = self.forward_batch(&points, &directions);
-        (colors[0], sigma[0])
-    }
-
     pub fn forward_batch(&self, points: &Matrix, view_dirs: &[Vec3]) -> (Vec<Vec3>, Vec<f32>) {
         let batch = points.cols();
         if batch == 0 {

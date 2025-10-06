@@ -43,31 +43,6 @@ fn load_tf_samples(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     Ok(samples)
 }
 
-//fn compute_final_color(o: Vec3, d: Vec3, t: &Vec<f32>, network: &Network) -> Vec3 {
-//    let mut c = Vec::new();
-//    let mut sigma = Vec::new();
-//    let n = t.len();
-//    let d_hat = d.normalize();
-
-//    for i in 0..n {
-//        let p = o + d_hat * t[i];
-//        let (c_i, sigma_i) = network.forward(&p, &d_hat);
-//        c.push(c_i);
-//        sigma.push(sigma_i);
-//    }
-//    let mut t_prod = 1.0f32;
-//    let mut c_final = Vec3::new(0.0, 0.0, 0.0);
-//    for i in 0..n - 1 {
-//        let delta_i = t[i + 1] - t[i];
-//        let alpha_i = 1.0 - (-sigma[i] * delta_i).exp();
-//        let w_i = t_prod * alpha_i;
-//        c_final += c[i] * w_i;
-
-//        t_prod *= 1.0 - alpha_i;
-//    }
-//    c_final
-//}
-
 fn integrate_ray(colors: &[Vec3], sigmas: &[f32], t: &[f32], far: f32) -> Vec3 {
     let n = t.len();
     if n == 0 {
