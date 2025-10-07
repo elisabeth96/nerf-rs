@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>NeRF in rust</title>
+    <style>
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            margin: 2rem;
+            line-height: 1.6;
+            color: #222;
+            background-color: #fafafa;
+        }
+        header {
+            border-bottom: 2px solid #e0e0e0;
+            margin-bottom: 1.5rem;
+        }
+        h1, h2 {
+            color: #0a4b78;
+        }
+        a {
+            color: #0c70b6;
+        }
+        section {
+            margin-bottom: 2rem;
+            background-color: #fff;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 1.5rem;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+        }
+        code {
+            background-color: #efefef;
+            padding: 0.15rem 0.3rem;
+            border-radius: 4px;
+        }
+        ul {
+            padding-left: 1.5rem;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Neural Radiance Fields (NeRF) in Rust</h1>
+        <p>This short page documents the background behind NeRF and the work implemented in the <code>nerf-rs</code> project.</p>
+    </header>
+
+    <section id="what-is-nerf">
+        <h2>What is NeRF?</h2>
+        <p>
+            Neural Radiance Fields (NeRF) were introduced by Ben Mildenhall <em>et&nbsp;al.</em> in
+            “<a href="https://arxiv.org/abs/2003.08934" target="_blank" rel="noopener noreferrer">NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis</a>” (ECCV&nbsp;2020).
+            The method optimizes a fully-connected neural network that maps a 3D position and viewing direction to color and volume density, allowing novel views of a scene to be rendered via volume rendering.
+        </p>
+        <ul>
+            <li>A scene is represented implicitly: no mesh or explicit voxels are stored.</li>
+            <li>Rendering uses stratified sampling along camera rays plus hierarchical importance resampling.</li>
+            <li>Training requires multiple calibrated images of the scene along with known camera poses.</li>
+        </ul>
+        <p>
+            Additional resources: the original project page (<a href="https://www.matthewtancik.com/nerf" target="_blank" rel="noopener noreferrer">matthewtancik.com/nerf</a>) and the open-source TensorFlow implementation (<a href="https://github.com/bmild/nerf" target="_blank" rel="noopener noreferrer">github.com/bmild/nerf</a>).
+        </p>
+    </section>
+
+    <section id="implementation">
+        <h2>Implementation Overview</h2>
+        <p>
+            The Rust implementation follows the structure of the original NeRF renderer while leveraging the pre-trained Lego scene weights under <code>lego_rust/</code>.
+            Rendering happens in two passes per ray:
+        </p>
+        <ul>
+            <li><strong>Coarse pass:</strong> 64 stratified samples between the near and far bounds are evaluated with the coarse MLP to estimate density along the ray.</li>
+            <li><strong>Fine pass:</strong> 128 additional points are drawn by building a probability distribution from the coarse densities and resampling via inverse-CDF. These merged samples are then evaluated with the fine network to produce the final color.</li>
+        </ul>
+        <p>
+            Key files and responsibilities include:</p>
+        <ul>
+            <li><code>src/network.rs</code>: matrix utilities, positional encodings, and batched forward passes for the coarse and fine MLPs.</li>
+            <li><code>src/main.rs</code>: camera setup, hierarchical sampling logic, volumetric integration, and <code>render_image</code> orchestrating coarse and fine passes.</li>
+            <li><code>lego_rust/</code>: serialized network weights and the reference sample JSON used for camera parameters and unit tests.</li>
+        </ul>
+        <p>
+            Recent improvements introduced hierarchical resampling inside <code>render_image</code>, moving from a coarse-only renderer to the two-stage pipeline described in the paper. The unit test <code>tests::coarse_and_fine_match_reference_examples</code> continues to validate both networks against known samples.
+        </p>
+        <p>
+            To replicate the rendering showcased in the paper, run <code>cargo run --release</code>; the output image will be written as <code>output.ppm</code> in the project root.
+        </p>
+    </section>
+</body>
+</html>

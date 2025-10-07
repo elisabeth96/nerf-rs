@@ -2,15 +2,17 @@ mod network;
 mod vec3;
 
 use network::{Layer, Matrix, Network};
+use rand::Rng;
 use rayon::prelude::*;
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 use vec3::Vec3;
 
@@ -51,10 +53,7 @@ fn load_network_from_dir(dir: &Path) -> Network {
         params.insert(name, (dims, data));
     }
 
-    fn take_matrix(
-        params: &mut HashMap<String, (Vec<usize>, Vec<f32>)>,
-        name: &str,
-    ) -> Matrix {
+    fn take_matrix(params: &mut HashMap<String, (Vec<usize>, Vec<f32>)>, name: &str) -> Matrix {
         let (dims, data) = params
             .remove(name)
             .unwrap_or_else(|| panic!("missing matrix parameter: {name}"));
@@ -86,7 +85,10 @@ fn load_network_from_dir(dir: &Path) -> Network {
     let layers = dense_specs
         .into_iter()
         .map(|(kernel, bias)| {
-            Layer::new(take_matrix(&mut params, kernel), take_bias(&mut params, bias))
+            Layer::new(
+                take_matrix(&mut params, kernel),
+                take_bias(&mut params, bias),
+            )
         })
         .collect();
 
@@ -121,30 +123,13 @@ fn integrate_ray(colors: &[Vec3], sigmas: &[f32], t: &[f32], far: f32) -> Vec3 {
     debug_assert_eq!(colors.len(), n);
     debug_assert_eq!(sigmas.len(), n);
 
-    let mut transmittance = 1.0f32;
     let mut rgb = Vec3::new(0.0, 0.0, 0.0);
     let mut acc = 0.0f32;
 
-    for i in 0..n {
-        let c_i = colors[i];
-        let sigma_i = sigmas[i];
-
-        let delta = if i + 1 < n {
-            t[i + 1] - t[i]
-        } else {
-            far - t[i]
-        };
-
-        let alpha = 1.0 - (-sigma_i * delta).exp();
-        let w = transmittance * alpha;
-
-        rgb += c_i * w;
-        acc += w;
-        transmittance *= 1.0 - alpha;
-
-        if transmittance < 1e-4 {
-            break;
-        }
+    let weights = compute_weights(sigmas, t, far);
+    for (color, w) in colors.iter().zip(weights.iter()) {
+        rgb += *color * *w;
+        acc += *w;
     }
 
     rgb + Vec3::new(1.0, 1.0, 1.0) * (1.0 - acc)
@@ -186,28 +171,154 @@ impl Camera {
     }
 }
 
-fn get_sample_locs(near: f32, far: f32, n: usize) -> Vec<f32> {
-    let mut t = Vec::with_capacity(n);
-    let step = (far - near) / n as f32;
-    for i in 0..n {
-        let u = 0.5;
-        t.push(near + (i as f32 + u) * step);
+fn stratified_samples(rng: &mut impl Rng, near: f32, far: f32, count: usize) -> Vec<f32> {
+    let mut t = Vec::with_capacity(count);
+    if count == 0 {
+        return t;
     }
+
+    let interval = (far - near) / count as f32;
+    for i in 0..count {
+        let lower = near + i as f32 * interval;
+        let upper = lower + interval;
+        let jitter = rng.gen_range(0.0..1.0);
+        t.push(lower + (upper - lower) * jitter);
+    }
+
     t
 }
 
-fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
+fn compute_weights(sigmas: &[f32], t: &[f32], far: f32) -> Vec<f32> {
+    let n = t.len();
+    debug_assert_eq!(
+        sigmas.len(),
+        n,
+        "weights require matching sigma/sample counts"
+    );
+
+    let mut weights = Vec::with_capacity(n);
+    let mut transmittance = 1.0f32;
+
+    for i in 0..n {
+        let mut delta = if i + 1 < n {
+            t[i + 1] - t[i]
+        } else {
+            far - t[i]
+        };
+        if delta < 0.0 {
+            delta = 0.0;
+        }
+
+        let alpha = 1.0 - (-sigmas[i] * delta).exp();
+        let w = transmittance * alpha;
+        weights.push(w);
+        transmittance *= 1.0 - alpha;
+
+        if transmittance < 1e-4 {
+            weights.extend(std::iter::repeat(0.0).take(n - i - 1));
+            break;
+        }
+    }
+
+    weights
+}
+
+fn midpoints(values: &[f32]) -> Vec<f32> {
+    values.windows(2).map(|w| 0.5 * (w[0] + w[1])).collect()
+}
+
+fn sample_importance(
+    rng: &mut impl Rng,
+    samples: &[f32],
+    weights: &[f32],
+    count: usize,
+) -> Vec<f32> {
+    if count == 0 || samples.len() < 3 || weights.len() < 3 {
+        return Vec::new();
+    }
+
+    let pdf_weights = &weights[1..weights.len() - 1];
+    if pdf_weights.is_empty() {
+        return Vec::new();
+    }
+
+    let bins = midpoints(samples);
+    if bins.len() < 2 || bins.len() != pdf_weights.len() + 1 {
+        return Vec::new();
+    }
+
+    let mut adjusted: Vec<f32> = pdf_weights.iter().map(|&w| w.max(0.0) + 1e-5).collect();
+    let sum: f32 = adjusted.iter().sum();
+    if sum <= 0.0 {
+        return Vec::new();
+    }
+
+    for w in adjusted.iter_mut() {
+        *w /= sum;
+    }
+
+    let mut cdf = Vec::with_capacity(adjusted.len() + 1);
+    cdf.push(0.0);
+    let mut cumulative = 0.0;
+    for &p in &adjusted {
+        cumulative += p;
+        cdf.push(cumulative);
+    }
+    if let Some(last) = cdf.last_mut() {
+        *last = 1.0;
+    }
+
+    let mut samples_out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let u = rng.gen_range(0.0..1.0);
+        let mut idx = adjusted.len() - 1;
+        for j in 0..adjusted.len() {
+            if u >= cdf[j] && u < cdf[j + 1] {
+                idx = j;
+                break;
+            }
+        }
+
+        let cdf_lower = cdf[idx];
+        let cdf_upper = cdf[idx + 1];
+        let denom = (cdf_upper - cdf_lower).max(1e-6);
+        let bin_lower = bins[idx];
+        let bin_upper = bins[idx + 1];
+        let t = (u - cdf_lower) / denom;
+        samples_out.push(bin_lower + (bin_upper - bin_lower) * t);
+    }
+
+    samples_out
+}
+
+fn render_image(
+    coarse: &Network,
+    fine: &Network,
+    camera: &Camera,
+    fine_samples_per_ray: usize,
+) -> Vec<Vec3> {
     let origin = camera.pos;
     let total_pixels = camera.nx * camera.ny;
-    let sample_positions = get_sample_locs(camera.near, camera.far, camera.samples_per_ray);
-    assert!(!sample_positions.is_empty(), "samples_per_ray must be greater than 0");
+    let coarse_samples_per_ray = camera.samples_per_ray;
+    assert!(
+        coarse_samples_per_ray > 0,
+        "coarse samples per ray must be greater than 0"
+    );
 
     let pixel_count = Arc::new(AtomicUsize::new(0));
     let pixel_count_clone = pixel_count.clone();
 
     let block_size = 8usize;
-    assert_eq!(camera.nx % block_size, 0, "image width must be multiple of block size");
-    assert_eq!(camera.ny % block_size, 0, "image height must be multiple of block size");
+    assert_eq!(
+        camera.nx % block_size,
+        0,
+        "image width must be multiple of block size"
+    );
+    assert_eq!(
+        camera.ny % block_size,
+        0,
+        "image height must be multiple of block size"
+    );
 
     let block_coords: Vec<(usize, usize)> = (0..camera.ny)
         .step_by(block_size)
@@ -229,38 +340,95 @@ fn render_image(network: &Network, camera: &Camera) -> Vec<Vec3> {
                 }
             }
 
-            let samples_per_ray = sample_positions.len();
-            let total_samples = rays.len() * samples_per_ray;
-            let mut points = Matrix::zeros(3, total_samples as i32);
-            let mut view_dirs = Vec::with_capacity(total_samples);
+            let mut coarse_rng = rand::thread_rng();
+            let coarse_samples: Vec<Vec<f32>> = rays
+                .iter()
+                .map(|_| {
+                    stratified_samples(
+                        &mut coarse_rng,
+                        camera.near,
+                        camera.far,
+                        coarse_samples_per_ray,
+                    )
+                })
+                .collect();
+
+            let total_coarse_samples = rays.len() * coarse_samples_per_ray;
+            let mut coarse_points = Matrix::zeros(3, total_coarse_samples as i32);
+            let mut coarse_view_dirs = Vec::with_capacity(total_coarse_samples);
 
             for (ray_idx, (_, dir_hat)) in rays.iter().enumerate() {
-                for (sample_idx, &ti) in sample_positions.iter().enumerate() {
-                    let col = ray_idx * samples_per_ray + sample_idx;
+                let samples = &coarse_samples[ray_idx];
+                for (sample_idx, &ti) in samples.iter().enumerate() {
+                    let col = ray_idx * coarse_samples_per_ray + sample_idx;
                     let p = origin + *dir_hat * ti;
-                    points.set(0, col, p.x);
-                    points.set(1, col, p.y);
-                    points.set(2, col, p.z);
-                    view_dirs.push(*dir_hat);
+                    coarse_points.set(0, col, p.x);
+                    coarse_points.set(1, col, p.y);
+                    coarse_points.set(2, col, p.z);
+                    coarse_view_dirs.push(*dir_hat);
                 }
             }
 
-            let (sample_colors, sample_sigmas) = network.forward_batch(&points, &view_dirs);
+            let (_, coarse_sigmas) = coarse.forward_batch(&coarse_points, &coarse_view_dirs);
+
+            let mut fine_samples_per_ray_list = Vec::with_capacity(rays.len());
+            let mut fine_rng = rand::thread_rng();
+
+            for ray_idx in 0..rays.len() {
+                let start = ray_idx * coarse_samples_per_ray;
+                let end = start + coarse_samples_per_ray;
+                let coarse_ts = &coarse_samples[ray_idx];
+                let sigmas_slice = &coarse_sigmas[start..end];
+                let weights = compute_weights(sigmas_slice, coarse_ts, camera.far);
+
+                let mut merged = coarse_ts.clone();
+                let extra =
+                    sample_importance(&mut fine_rng, coarse_ts, &weights, fine_samples_per_ray);
+                merged.extend(extra);
+                merged.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                fine_samples_per_ray_list.push(merged);
+            }
+
+            let total_fine_samples: usize = fine_samples_per_ray_list
+                .iter()
+                .map(|samples| samples.len())
+                .sum();
+            let mut fine_points = Matrix::zeros(3, total_fine_samples as i32);
+            let mut fine_view_dirs = Vec::with_capacity(total_fine_samples);
+
+            let mut fine_offsets = Vec::with_capacity(rays.len());
+            let mut col = 0usize;
+            for (ray_idx, samples) in fine_samples_per_ray_list.iter().enumerate() {
+                fine_offsets.push(col);
+                let (_, dir_hat) = rays[ray_idx];
+                for &ti in samples {
+                    let p = origin + dir_hat * ti;
+                    fine_points.set(0, col, p.x);
+                    fine_points.set(1, col, p.y);
+                    fine_points.set(2, col, p.z);
+                    fine_view_dirs.push(dir_hat);
+                    col += 1;
+                }
+            }
+
+            let (fine_colors, fine_sigmas) = fine.forward_batch(&fine_points, &fine_view_dirs);
 
             let mut results = Vec::with_capacity(rays.len());
             for (ray_idx, (pixel_index, _)) in rays.iter().enumerate() {
-                let start = ray_idx * samples_per_ray;
-                let end = start + samples_per_ray;
+                let start = fine_offsets[ray_idx];
+                let samples = &fine_samples_per_ray_list[ray_idx];
+                let end = start + samples.len();
                 let color = integrate_ray(
-                    &sample_colors[start..end],
-                    &sample_sigmas[start..end],
-                    &sample_positions,
+                    &fine_colors[start..end],
+                    &fine_sigmas[start..end],
+                    samples,
                     camera.far,
                 );
                 results.push((*pixel_index, color));
             }
 
-            let processed = pixel_count_clone.fetch_add(rays.len(), Ordering::Relaxed) + rays.len();
+            let processed =
+                pixel_count_clone.fetch_add(rays.len(), AtomicOrdering::Relaxed) + rays.len();
             let prev = processed - rays.len();
             if processed / 5000 != prev / 5000 {
                 let progress = (processed as f32 / total_pixels as f32) * 100.0;
@@ -315,24 +483,29 @@ fn get_vec3(node: &Value, key: &str) -> Vec3 {
 fn main() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.join("lego_rust");
-    let network = load_network_from_dir(&root.join("coarse"));
+    let coarse_network = load_network_from_dir(&root.join("coarse"));
+    let fine_network = load_network_from_dir(&root.join("fine"));
 
     let samples = load_tf_samples(&root.join("tf_reference_samples.json")).unwrap();
 
     let near = samples["near"].as_f64().unwrap() as f32;
     let far = samples["far"].as_f64().unwrap() as f32;
-    let samples_per_ray = samples["samples_per_ray"].as_u64().unwrap() as usize;
     let pos = get_vec3(&samples, "camera_origin");
     let dir = get_vec3(&samples, "camera_forward").normalize();
     let up = get_vec3(&samples, "camera_up").normalize();
 
-    // print samples per ray
-    println!("Samples per ray: {}", samples_per_ray);
+    let coarse_samples_per_ray = 64;
+    let fine_samples_per_ray = 128;
+
+    println!(
+        "Rendering with {} coarse samples and {} fine samples per ray",
+        coarse_samples_per_ray, fine_samples_per_ray
+    );
 
     // fill in image resolution/FOV however you like
     let cam = Camera {
-        nx: 512,
-        ny: 512,
+        nx: 4096,
+        ny: 4096,
         alpha_width: PI / 8.0,
         alpha_height: PI / 8.0,
         pos,
@@ -340,12 +513,12 @@ fn main() {
         up,
         near,
         far,
-        samples_per_ray,
+        samples_per_ray: coarse_samples_per_ray,
     };
 
     println!("Starting image rendering...");
     let render_start = Instant::now();
-    let image = render_image(&network, &cam);
+    let image = render_image(&coarse_network, &fine_network, &cam, fine_samples_per_ray);
     let render_duration = render_start.elapsed();
 
     println!(
