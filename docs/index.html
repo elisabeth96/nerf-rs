@@ -29,6 +29,23 @@
             padding: 1.5rem;
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
         }
+        button {
+            background-color: #0c70b6;
+            border: none;
+            border-radius: 4px;
+            color: #fff;
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0.65rem 1.2rem;
+        }
+        button:disabled {
+            background-color: #6ba8d6;
+            cursor: not-allowed;
+        }
+        #renderStatus {
+            margin-top: 1rem;
+            font-weight: 600;
+        }
         code {
             background-color: #efefef;
             padding: 0.15rem 0.3rem;
@@ -36,6 +53,29 @@
         }
         ul {
             padding-left: 1.5rem;
+        }
+        canvas {
+            border: 1px solid #d0d0d0;
+            margin-top: 1rem;
+        }
+        .spinner {
+            display: inline-block;
+            width: 1.25rem;
+            height: 1.25rem;
+            border: 3px solid #c8daea;
+            border-top-color: #0c70b6;
+            border-radius: 50%;
+            animation: spin 0.9s linear infinite;
+            margin-left: 0.75rem;
+            vertical-align: middle;
+        }
+        .spinner.hidden {
+            display: none;
+        }
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
         }
     </style>
 </head>
@@ -76,15 +116,87 @@
             Key files and responsibilities include:</p>
         <ul>
             <li><code>src/network.rs</code>: matrix utilities, positional encodings, and batched forward passes for the coarse and fine MLPs.</li>
-            <li><code>src/main.rs</code>: camera setup, hierarchical sampling logic, volumetric integration, and <code>render_image</code> orchestrating coarse and fine passes.</li>
+            <li><code>src/lib.rs</code>: camera setup, hierarchical sampling logic, volumetric integration, and the shared render pipeline used by both CLI and WebAssembly builds.</li>
             <li><code>lego_rust/</code>: serialized network weights and the reference sample JSON used for camera parameters and unit tests.</li>
         </ul>
         <p>
             Recent improvements introduced hierarchical resampling inside <code>render_image</code>, moving from a coarse-only renderer to the two-stage pipeline described in the paper. The unit test <code>tests::coarse_and_fine_match_reference_examples</code> continues to validate both networks against known samples.
         </p>
         <p>
-            To replicate the rendering showcased in the paper, run <code>cargo run --release</code>; the output image will be written as <code>output.ppm</code> in the project root.
+            The native binary still uses Rayon for multithreaded rendering, while the WebAssembly build runs sequentially so it can be hosted anywhere (including GitHub Pages) without special headers.
+        </p>
+        <p>
+            To replicate the rendering showcased in the paper, run <code>cargo run --release</code>; the output image (now rendered at <code>256 × 256</code>) will be written as <code>output.ppm</code> in the project root.
         </p>
     </section>
+
+    <section id="render-action">
+        <h2>Interactive Render (256×256)</h2>
+        <p>
+            Build the WebAssembly bundle once with
+            <code>wasm-pack build --target web --release --out-dir docs/pkg</code>.
+            Host <code>docs/</code> from any static server (GitHub Pages works out of the box). For local testing you can run
+            <code>python3 -m http.server --directory docs</code> and then click the button to render the Lego scene at
+            <code>256 × 256</code> directly below.
+        </p>
+        <button id="renderButton" type="button">Render 256×256 Image</button>
+        <span id="renderSpinner" class="spinner hidden" aria-hidden="true"></span>
+        <p id="renderStatus" role="status" aria-live="polite"></p>
+        <canvas id="renderCanvas" width="256" height="256"></canvas>
+    </section>
+
+    <script type="module">
+        import initWasm, { init_renderer, render_image_rgba } from './pkg/nerf_rs.js';
+
+        const button = document.getElementById('renderButton');
+        const statusNode = document.getElementById('renderStatus');
+        const spinner = document.getElementById('renderSpinner');
+        const canvas = document.getElementById('renderCanvas');
+        const ctx = canvas?.getContext('2d');
+
+        let wasmReady;
+
+        async function ensureWasmReady() {
+            if (!wasmReady) {
+                wasmReady = (async () => {
+                    await initWasm();
+                    try {
+                        await init_renderer();
+                        if (!statusNode.textContent) {
+                            statusNode.textContent = 'Renderer ready.';
+                        }
+                    } catch (error) {
+                        console.warn('Renderer initialisation skipped', error);
+                    }
+                })();
+            }
+            return wasmReady;
+        }
+
+        if (button && statusNode && ctx) {
+            button.addEventListener('click', async () => {
+                await ensureWasmReady();
+                button.disabled = true;
+                statusNode.textContent = 'Rendering 256×256 image…';
+                spinner?.classList.remove('hidden');
+
+                try {
+                    const rgba = await render_image_rgba(256, 256);
+                    const imageData = new ImageData(new Uint8ClampedArray(rgba), 256, 256);
+                    ctx.putImageData(imageData, 0, 0);
+                    statusNode.textContent = 'Render complete!';
+                } catch (error) {
+                    console.error(error);
+                    statusNode.textContent = `Render failed: ${error}`;
+                } finally {
+                    button.disabled = false;
+                    spinner?.classList.add('hidden');
+                }
+            });
+
+            // Pre-load Wasm when the page is ready.
+            ensureWasmReady();
+        }
+    </script>
 </body>
 </html>
