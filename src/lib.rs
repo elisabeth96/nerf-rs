@@ -600,6 +600,17 @@ fn get_vec3(node: &Value, key: &str) -> Vec3 {
     )
 }
 
+fn default_sample_counts() -> (usize, usize) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (32, 64)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        (64, 128)
+    }
+}
+
 fn camera_from_samples(
     samples: &Value,
     width: usize,
@@ -642,8 +653,7 @@ pub fn render_cli_image() {
 
     let samples = load_tf_samples(&root.join("tf_reference_samples.json")).unwrap();
 
-    let coarse_samples_per_ray = 64;
-    let fine_samples_per_ray = 128;
+    let (coarse_samples_per_ray, fine_samples_per_ray) = default_sample_counts();
     let width = 256;
     let height = 256;
 
@@ -701,8 +711,7 @@ pub fn render_image_rgba(width: u32, height: u32) -> Result<Uint8Array, JsValue>
     let samples = load_tf_samples(Path::new("lego_rust/tf_reference_samples.json"))
         .map_err(|e| JsValue::from_str(&format!("failed to load samples: {e}")))?;
 
-    let coarse_samples_per_ray = 64;
-    let fine_samples_per_ray = 128;
+    let (coarse_samples_per_ray, fine_samples_per_ray) = default_sample_counts();
     let camera = camera_from_samples(&samples, width, height, coarse_samples_per_ray);
 
     let pixels = render_image(

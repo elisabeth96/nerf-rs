@@ -134,10 +134,8 @@
         <h2>Interactive Render (256×256)</h2>
         <p>
             Build the WebAssembly bundle once with
-            <code>wasm-pack build --target web --release --out-dir docs/pkg</code>.
-            Host <code>docs/</code> from any static server (GitHub Pages works out of the box). For local testing you can run
-            <code>python3 -m http.server --directory docs</code> and then click the button to render the Lego scene at
-            <code>256 × 256</code> directly below.
+            <code>wasm-pack build --target web --release --out-dir docs/pkg</code> and publish the <code>docs/</code>
+            folder (for example via GitHub Pages). After that, users just open the site and press the button—no extra setup required.
         </p>
         <button id="renderButton" type="button">Render 256×256 Image</button>
         <span id="renderSpinner" class="spinner hidden" aria-hidden="true"></span>
@@ -162,9 +160,7 @@
                     await initWasm();
                     try {
                         await init_renderer();
-                        if (!statusNode.textContent) {
-                            statusNode.textContent = 'Renderer ready.';
-                        }
+                        statusNode.textContent = 'Renderer ready. Click the button to start.';
                     } catch (error) {
                         console.warn('Renderer initialisation skipped', error);
                     }
@@ -177,7 +173,7 @@
             button.addEventListener('click', async () => {
                 await ensureWasmReady();
                 button.disabled = true;
-                statusNode.textContent = 'Rendering 256×256 image…';
+                statusNode.textContent = 'Rendering 256×256 image… (this may take a few seconds)';
                 spinner?.classList.remove('hidden');
 
                 try {
